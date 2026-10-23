@@ -1,0 +1,491 @@
+--- harmonia_neural_v3_original.py	2026-10-21 10:42:47.263977298 +0000
++++ harmonia_neural.py	2026-10-21 10:42:47.324117120 +0000
+@@ -26,6 +26,43 @@
+     (max diff 1.6e-14 in float64) against scipy.fftpack.dct(type=2,
+     norm='ortho') using log_mel actually produced by this pipeline,
+     not a synthetic tensor.
++
++REVISION NOTES (this revision, applied on top of the file above)
++  NOT EXECUTED: the environment these edits were written in had no torch,
++  transformers, whisper or network. Syntax, undefined names and shape
++  arithmetic were checked; the tests in test_harmonia_neural_fixes.py were
++  written but NOT run. Treat every item below as "fixed by reading", not
++  "fixed and verified", until you run them with torch installed.
++
++  1. Whisper semantic backend. SemanticAnchor(backend="whisper") uses the
++     frozen openai-whisper ENCODER as the semantic feature extractor
++     (ModelCfg.semantic_backend, default "whisper"). The stock encoder
++     forward asserts a fixed 30 s input (3000 mel frames); this version runs
++     conv1/conv2/blocks/ln_post itself and slices the positional embedding,
++     so 1 s training segments are not padded to 30 s. Backends: "whisper",
++     "wavlm", "mfcc", "auto" (whisper, then wavlm, then mfcc).
++  2. harp_loss_stft: _one_step passes (B, 1, T); torch.stft takes 1-D/2-D.
++     Squeezes the channel dim, uses a Hann window, passes the real bin count.
++  3. train(): refuses a silent MFCC fallback (README Known issue #3). Raises
++     unless TrainCfg.allow_semantic_fallback is True. Checked twice: before
++     building anything (package availability) and after building the model
++     (weights failed to load, e.g. offline).
++  4. Discriminator step: d_loss was computed INSIDE torch.no_grad() and then
++     .backward() was called on it, which raises on the first step. Moved to
++     _d_step(): generator output under no_grad, discriminator loss with grad.
++  5. Semantic frame-rate mismatch: latents run at sr/200 (120 fps at 24 kHz),
++     WavLM/Whisper at 50 fps, MFCC at 100 fps, and the diffusion head adds
++     sem_proj(sem) to lat_in(z) with no resampling. DiffusionHeadNN now
++     linearly resamples sem to the latent frame count (_align_time).
++  6. SemanticAnchor resampled with torchaudio if present, and otherwise fed
++     24 kHz audio to a 16 kHz model silently. Now falls back to linear
++     interpolation (flagged via degraded_resample), never the wrong rate.
++  7. SemanticAnchor.train(): model.train() flipped the frozen backbone back
++     into train mode (dropout on). Frozen backbones are forced to eval.
++  8. load_ckpt compares use_semantic/semantic_backend/whisper_model too, so a
++     backend change fails with a clear message instead of a state_dict error.
++  Not touched: CausalTransposedConv1d (known broken, intentionally left),
++  VRVQ architecture, numpy codec.
+ """
+ from __future__ import annotations
+ import argparse, json, math, os, sys, time
+@@ -51,6 +88,18 @@
+ except Exception:
+     WAVLM_AVAILABLE = False
+ 
++# openai-whisper (pip install openai-whisper). NOTE: the PyPI package named
++# plain "whisper" is a different project; require load_model + audio.mel_filters.
++try:
++    import whisper as _whisper
++    from whisper import audio as _whisper_audio
++    WHISPER_AVAILABLE = (hasattr(_whisper, "load_model")
++                         and hasattr(_whisper_audio, "mel_filters"))
++except Exception:
++    _whisper = None
++    _whisper_audio = None
++    WHISPER_AVAILABLE = False
++
+ CHECKPOINT_FORMAT_VERSION = 1
+ 
+ 
+@@ -656,16 +705,54 @@
+     return loss / max(count, 1)
+ 
+ 
++def _align_time(x, T):
++    """Resample a (B, T', D) feature sequence to exactly T frames along time
++    (linear). No-op when T' == T. Used to line semantic features (50-100 fps)
++    up with the latent frames (sr/200 fps)."""
++    if x.shape[1] == T:
++        return x
++    y = F.interpolate(x.transpose(1, 2), size=T, mode="linear",
++                      align_corners=False)
++    return y.transpose(1, 2)
++
++
++def _to_16k(x, sr):
++    """(B, T) at `sr` Hz -> (B, T16) at 16 kHz. Uses torchaudio when present,
++    otherwise linear interpolation. Never returns audio at the wrong rate."""
++    if sr == 16000:
++        return x
++    if HAVE_TA:
++        return torchaudio.functional.resample(x, sr, 16000)
++    n = max(1, int(round(x.shape[-1] * 16000 / sr)))
++    return F.interpolate(x.unsqueeze(1), size=n, mode="linear",
++                         align_corners=False).squeeze(1)
++
++
+ def harp_loss_stft(y_stage_list, x, harp_part, device, n_fft=1024, hop=256):
+     if not y_stage_list:
+         return torch.tensor(0.0, device=device)
+-    X = torch.stft(x, n_fft, hop, return_complex=True).abs()
++    # FIX: _one_step passes xw with shape (B, 1, T). torch.stft accepts only
++    # 1-D / 2-D input; on 3-D it errors (or yields a tensor whose "bins" axis
++    # is the channel count, making band_weight see 1 bin instead of 513).
++    if x.dim() == 3:
++        if x.shape[1] != 1:
++            raise ValueError(f"harp_loss_stft: expected 1 channel, got {x.shape[1]}")
++        x = x.squeeze(1)
++    if x.dim() != 2:
++        raise ValueError(f"harp_loss_stft: x must be (B, T) or (B, 1, T), "
++                         f"got {tuple(x.shape)}")
++    window = torch.hann_window(n_fft, device=x.device)
++    n_bins = n_fft // 2 + 1
++    X = torch.stft(x, n_fft, hop, window=window, return_complex=True).abs()
+     losses = []
+     for s, y_s in enumerate(y_stage_list):
+-        Y = torch.stft(y_s.squeeze(1), n_fft, hop, return_complex=True).abs()
++        if y_s.dim() == 3:
++            y_s = y_s.squeeze(1)
++        Y = torch.stft(y_s, n_fft, hop, window=window,
++                       return_complex=True).abs()
+         T_min = min(X.shape[-1], Y.shape[-1])
+-        resid = (X[..., :T_min] - Y[..., :T_min]).pow(2).mean(dim=(0, 2))
+-        w = harp_part.band_weight(s, resid.shape[0], device)
++        resid = (X[..., :T_min] - Y[..., :T_min]).pow(2).mean(dim=(0, 2))  # (n_bins,)
++        w = harp_part.band_weight(s, n_bins, device)
+         w = w / (w.sum() + 1e-8)
+         losses.append((w * resid).sum())
+     return torch.stack(losses).mean()
+@@ -676,23 +763,66 @@
+ # ══════════════════════════════════════════════════════════════════════
+ 
+ class SemanticAnchor(nn.Module):
++    """Frozen semantic feature extractor with a projector.
++
++    backend: "whisper" (frozen openai-whisper encoder, ~50 fps), "wavlm"
++    (microsoft/wavlm-base-plus via transformers, ~50 fps), "mfcc" (real MFCCs,
++    100 fps, no download) or "auto" (whisper, then wavlm, then mfcc).
++    If the requested backend cannot load, falls back toward MFCC and records
++    why in `fallback_reason`; `using_fallback` is True when the active
++    backend is MFCC although something else was requested. Training refuses
++    that unless explicitly allowed (see train()).
++    `whisper_encoder` lets a caller inject an already-built encoder (tests,
++    or a locally converted checkpoint) so no download happens.
++    """
++    BACKENDS = ("whisper", "wavlm", "mfcc", "auto")
++
+     def __init__(self, sr=24000, wavlm_id="microsoft/wavlm-base-plus",
+-                 layer=6, proj_dim=768, n_mfcc=40):
++                 layer=6, proj_dim=768, n_mfcc=40, backend="wavlm",
++                 whisper_model="base", whisper_layer=-1, whisper_encoder=None):
+         super().__init__()
++        if backend not in self.BACKENDS:
++            raise ValueError(f"backend must be one of {self.BACKENDS}, "
++                             f"got {backend!r}")
+         self.sr, self.layer = sr, layer
+         self.proj_dim, self.n_mfcc = proj_dim, n_mfcc
++        self.whisper_layer = whisper_layer
++        self.backend_requested = backend
++        self.backend_active = "mfcc"
++        self.fallback_reason = ""
++        self.degraded_resample = not HAVE_TA
+         self.wavlm = None
+-        self.using_fallback = not WAVLM_AVAILABLE
+-        self.projector = nn.Linear(proj_dim, proj_dim)
+-        if WAVLM_AVAILABLE:
++        self.whisper_enc = None
++        order = {"whisper": ["whisper", "mfcc"], "wavlm": ["wavlm", "mfcc"],
++                 "mfcc": ["mfcc"],
++                 "auto": ["whisper", "wavlm", "mfcc"]}[backend]
++        feat_dim, reasons = proj_dim, []
++        for name in order:
+             try:
+-                self.wavlm = WavLMModel.from_pretrained(wavlm_id)
+-                for p in self.wavlm.parameters(): p.requires_grad_(False)
+-                self.wavlm.eval()
+-                self.using_fallback = False
+-            except Exception:
++                if name == "whisper":
++                    self.whisper_enc = self._load_whisper(whisper_model,
++                                                          whisper_encoder)
++                    feat_dim = int(self.whisper_enc.positional_embedding.shape[1])
++                elif name == "wavlm":
++                    if not WAVLM_AVAILABLE:
++                        raise RuntimeError("transformers not importable "
++                                           "(pip install transformers)")
++                    m = WavLMModel.from_pretrained(wavlm_id)
++                    for p in m.parameters():
++                        p.requires_grad_(False)
++                    m.eval()
++                    self.wavlm = m
++                    feat_dim = int(m.config.hidden_size)
++                self.backend_active = name
++                break
++            except Exception as e:
++                reasons.append(f"{name}: {type(e).__name__}: {e}")
+                 self.wavlm = None
+-                self.using_fallback = True
++                self.whisper_enc = None
++        self.fallback_reason = "; ".join(reasons)
++        self.using_fallback = (self.backend_active == "mfcc"
++                               and backend != "mfcc")
++        self.projector = nn.Linear(feat_dim, proj_dim)
+         rng = np.random.default_rng(0)
+         self.register_buffer("mfcc_proj",
+                              torch.from_numpy(
+@@ -700,6 +830,84 @@
+                                                      ).astype(np.float32))
+                              / math.sqrt(n_mfcc))
+ 
++    def train(self, mode=True):
++        # FIX: model.train() used to flip the frozen backbone back into train
++        # mode (dropout active in WavLM). Frozen backbones stay in eval.
++        super().train(mode)
++        for m in (self.wavlm, self.whisper_enc):
++            if m is not None:
++                m.eval()
++        return self
++
++    @staticmethod
++    def _load_whisper(name, injected):
++        if injected is not None:
++            enc = injected
++        else:
++            if not WHISPER_AVAILABLE:
++                raise RuntimeError(
++                    "openai-whisper not importable (pip install openai-whisper;"
++                    " the PyPI package named 'whisper' is a different project)")
++            enc = _whisper.load_model(name, device="cpu").encoder
++        for attr in ("conv1", "conv2", "positional_embedding", "blocks",
++                     "ln_post"):
++            if not hasattr(enc, attr):
++                raise RuntimeError(f"whisper encoder has no '{attr}' "
++                                   "(unsupported openai-whisper version)")
++        for p in enc.parameters():
++            p.requires_grad_(False)
++        enc.eval()
++        return enc
++
++    @staticmethod
++    def _mel_filters(device, n_mels):
++        if _whisper_audio is None:
++            raise RuntimeError("whisper.audio unavailable: cannot build "
++                               "Whisper's mel filterbank")
++        try:
++            return _whisper_audio.mel_filters(device, n_mels)
++        except TypeError:                       # older openai-whisper: (device)
++            return _whisper_audio.mel_filters(device)
++
++    @torch.no_grad()
++    def _whisper_features(self, x):
++        """(B, T) at self.sr -> (B, T_enc, d_model) at ~50 fps.
++        Same log-mel recipe as openai-whisper (n_fft 400, hop 160, Hann,
++        clamp 1e-10, log10, floor at max-8, (x+4)/4). The stock encoder
++        forward asserts a fixed 30 s input, so conv/blocks are run here with
++        the positional embedding sliced to the actual length."""
++        enc = self.whisper_enc
++        x16 = _to_16k(x, self.sr)
++        if x16.shape[-1] < 400:
++            x16 = F.pad(x16, (0, 400 - x16.shape[-1]))
++        n_mels = enc.conv1.in_channels
++        window = torch.hann_window(400, device=x16.device)
++        stft = torch.stft(x16, 400, 160, window=window, return_complex=True)
++        mag = stft[..., :-1].abs() ** 2                       # (B, 201, frames)
++        mel = self._mel_filters(x16.device, n_mels) @ mag      # (B, n_mels, frames)
++        log = mel.clamp(min=1e-10).log10()
++        log = torch.maximum(log, log.amax(dim=(-2, -1), keepdim=True) - 8.0)
++        log = (log + 4.0) / 4.0
++        h = F.gelu(enc.conv1(log))
++        h = F.gelu(enc.conv2(h))
++        h = h.permute(0, 2, 1)                                 # (B, T_enc, d)
++        pe = enc.positional_embedding
++        if h.shape[1] > pe.shape[0]:
++            raise ValueError(
++                f"audio too long for the Whisper encoder: {h.shape[1]} frames "
++                f"> {pe.shape[0]} (30 s). Use shorter segments.")
++        h = (h + pe[:h.shape[1]]).to(h.dtype)
++        nb = len(enc.blocks)
++        k = self.whisper_layer
++        if k != -1 and not (0 <= k <= nb):
++            raise ValueError(f"whisper_layer must be -1 or 0..{nb}, got {k}")
++        stop = nb if k in (-1, nb) else k
++        for blk in list(enc.blocks)[:stop]:
++            h = blk(h)
++        if k == -1:
++            h = enc.ln_post(h)
++        return h, h.shape[-1]
++
+     @torch.no_grad()
+     def _mfcc_features(self, x):
+         """
+@@ -779,10 +987,12 @@
+ 
+     @torch.no_grad()
+     def _features(self, x):
++        if self.whisper_enc is not None:
++            return self._whisper_features(x)
+         if self.wavlm is not None:
+-            if self.sr != 16000 and HAVE_TA:
+-                x = Resample(self.sr, 16000)(x)
+-            out = self.wavlm(x, output_hidden_states=True)
++            # FIX: without torchaudio the audio used to reach WavLM at the
++            # wrong sample rate, silently. _to_16k always resamples.
++            out = self.wavlm(_to_16k(x, self.sr), output_hidden_states=True)
+             f = out.hidden_states[self.layer]
+             return f, f.shape[-1]
+         return self._mfcc_features(x)
+@@ -829,6 +1039,7 @@
+ 
+     def loss(self, z1, sem):
+         B, T, _ = z1.shape
++        sem = _align_time(sem, T)   # FIX: sem (50-100 fps) vs latents (sr/200 fps)
+         z0 = torch.randn_like(z1)
+         t = torch.rand(B, 1, device=z1.device)
+         zt = (1 - t[..., None]) * z0 + t[..., None] * z1
+@@ -840,6 +1051,7 @@
+     @torch.no_grad()
+     def sample(self, sem, T, latent_dim, steps=8, guidance=2.0):
+         B = sem.shape[0]
++        sem = _align_time(sem, T)
+         z = torch.randn(B, T, latent_dim, device=sem.device)
+         null = self.null_sem.expand(B, T, -1)
+         dt = 1.0 / steps
+@@ -870,6 +1082,9 @@
+     use_semantic: bool = True
+     use_otcfm: bool = True
+     use_diffusion: bool = True
++    semantic_backend: str = "whisper"   # "whisper" | "wavlm" | "mfcc" | "auto"
++    whisper_model: str = "base"         # openai-whisper model name (tiny/base/small/...)
++    whisper_layer: int = -1             # -1 = final (post-LN); 0..n_blocks = after k blocks
+ 
+ 
+ class NeuralHarmonia(nn.Module):
+@@ -887,11 +1102,16 @@
+                              cfg.harp_groups)
+         self.vrvq = VRVQRouterNN(cfg.latent_dim, cfg.n_stages)
+         self.otcfm = OTCFMNN(cfg.codebook_dim) if cfg.use_otcfm else None
+-        self.sem = SemanticAnchor(sr=cfg.sr) if cfg.use_semantic else None
++        self.sem = (SemanticAnchor(sr=cfg.sr, backend=cfg.semantic_backend,
++                                   whisper_model=cfg.whisper_model,
++                                   whisper_layer=cfg.whisper_layer)
++                    if cfg.use_semantic else None)
+         if self.sem is not None and self.sem.using_fallback:
+-            print("[SemanticAnchor] WavLM unavailable -- using MFCC fallback "
+-                  "(real features, not padding). Set use_semantic=False to "
+-                  "disable.")
++            print(f"[SemanticAnchor] '{self.sem.backend_requested}' unavailable "
++                  f"-- using MFCC fallback (real features, not padding). "
++                  f"Reason: {self.sem.fallback_reason}. Set use_semantic=False "
++                  f"to disable. train() refuses this unless "
++                  f"allow_semantic_fallback is set.")
+         sem_dim = self.sem.projector.out_features if self.sem is not None else 0
+         self.diff = DiffusionHeadNN(cfg.codebook_dim, sem_dim) \
+             if cfg.use_diffusion else None
+@@ -1038,7 +1258,8 @@
+         saved = ck["cfg"]
+         current = asdict(model.cfg)
+         for k in ("n_stages", "n_experts", "codebook_size", "codebook_dim",
+-                  "latent_dim", "enc_dim"):
++                  "latent_dim", "enc_dim", "use_semantic", "semantic_backend",
++                  "whisper_model"):
+             if k in saved and saved[k] != current.get(k):
+                 raise RuntimeError(
+                     f"checkpoint cfg mismatch on '{k}': "
+@@ -1076,6 +1297,7 @@
+     w_diff: float = 0.5
+     w_harp: float = 0.1
+     use_harp_loss: bool = False
++    allow_semantic_fallback: bool = False   # True = permit MFCC when the semantic backend is missing
+     log_every: int = 50
+     save_every: int = 5000
+     ckpt_dir: str = "checkpoints"
+@@ -1125,7 +1347,63 @@
+     }
+ 
+ 
++def semantic_preflight(model_cfg: ModelCfg, allow_fallback: bool = False):
++    """Refuse (before building anything) when the requested semantic backend
++    cannot even be imported. README Known issue #3 / Fix Plan section 5."""
++    if not model_cfg.use_semantic:
++        return
++    b = model_cfg.semantic_backend
++    avail = {"whisper": WHISPER_AVAILABLE, "wavlm": WAVLM_AVAILABLE,
++             "mfcc": True,
++             "auto": WHISPER_AVAILABLE or WAVLM_AVAILABLE}
++    if b not in avail:
++        raise ValueError(f"unknown semantic_backend {b!r}")
++    if not avail[b] and not allow_fallback:
++        hint = {"whisper": "pip install openai-whisper",
++                "wavlm": "pip install transformers",
++                "auto": "pip install openai-whisper (or transformers)"}[b]
++        raise RuntimeError(
++            f"use_semantic=True with semantic_backend='{b}' but it is not "
++            f"importable ({hint}) -- refusing silent MFCC fallback during "
++            f"training. Use semantic_backend='mfcc' or use_semantic=False "
++            f"deliberately, or set allow_semantic_fallback=True.")
++
++
++def semantic_postcheck(model, allow_fallback: bool = False):
++    """Second guard: the package imported but the weights failed to load
++    (offline, bad name). SemanticAnchor swallowed that and fell back."""
++    sem = getattr(model, "sem", None)
++    if sem is not None and sem.using_fallback and not allow_fallback:
++        raise RuntimeError(
++            f"semantic backend '{sem.backend_requested}' failed to load "
++            f"({sem.fallback_reason}) -- refusing silent MFCC fallback during "
++            f"training. Fix the install/weights, choose "
++            f"semantic_backend='mfcc' deliberately, or set "
++            f"allow_semantic_fallback=True.")
++
++
++def _d_step(model, msd, mpd, cfg, x, opt_d):
++    """Discriminator update.
++    FIX: the loss used to be computed inside torch.no_grad() together with the
++    generator output, so d_loss had no grad_fn and d_loss.backward() raised.
++    Only the generator forward is no_grad now; the discriminator loss is built
++    with grad enabled."""
++    with torch.no_grad():
++        y_det = model(x)["y"]
++    xw = x.unsqueeze(1)
++    T = min(xw.shape[-1], y_det.shape[-1])
++    xw, y_det = xw[..., :T], y_det[..., :T]
++    d_loss = hinge_d(msd(xw), msd(y_det)) + hinge_d(mpd(xw), mpd(y_det))
++    opt_d.zero_grad()
++    d_loss.backward()
++    torch.nn.utils.clip_grad_norm_(
++        list(msd.parameters()) + list(mpd.parameters()), cfg.grad_clip)
++    opt_d.step()
++    return d_loss
++
++
+ def train(cfg: TrainCfg, model_cfg: ModelCfg, files: list):
++    semantic_preflight(model_cfg, cfg.allow_semantic_fallback)
+     device = torch.device(cfg.device)
+     seg_len = int(cfg.sr * cfg.segment_sec)
+     ds = SegmentDataset(files, cfg.sr, seg_len)
+@@ -1133,6 +1411,7 @@
+                     num_workers=cfg.num_workers, pin_memory=True,
+                     drop_last=True)
+     model = NeuralHarmonia(model_cfg).to(device)
++    semantic_postcheck(model, cfg.allow_semantic_fallback)
+     ema = EMA(model, cfg.ema_decay)
+     msd = MSD().to(device); mpd = MPD().to(device)
+     opt_g = torch.optim.AdamW(model.parameters(), lr=cfg.lr_g,
+@@ -1153,18 +1432,7 @@
+             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+             opt_g.step()
+             ema.update(model)
+-            with torch.no_grad():
+-                y_det = model(x)["y"]
+-                T = min(x.unsqueeze(1).shape[-1], y_det.shape[-1])
+-                d_loss = hinge_d(msd(x.unsqueeze(1)[..., :T]),
+-                                 msd(y_det[..., :T])) + \
+-                         hinge_d(mpd(x.unsqueeze(1)[..., :T]),
+-                                 mpd(y_det[..., :T]))
+-            opt_d.zero_grad()
+-            d_loss.backward()
+-            torch.nn.utils.clip_grad_norm_(
+-                list(msd.parameters()) + list(mpd.parameters()), cfg.grad_clip)
+-            opt_d.step()
++            d_loss = _d_step(model, msd, mpd, cfg, x, opt_d)
+             scale = lr_schedule(step, cfg)
+             for pg in opt_g.param_groups: pg["lr"] = cfg.lr_g * scale
+             for pg in opt_d.param_groups: pg["lr"] = cfg.lr_d * scale
+@@ -1254,9 +1522,12 @@
+         sys.exit(0 if ok else 1)
+     mcfg = ModelCfg(sr=args.sr, causal=args.causal,
+                     n_stages=args.stages, n_experts=args.experts,
+-                    top_k=args.top_k)
++                    top_k=args.top_k, use_semantic=not args.no_semantic,
++                    semantic_backend=args.semantic_backend,
++                    whisper_model=args.whisper_model)
+     cfg = TrainCfg(sr=args.sr, batch_size=args.bs, total_steps=args.steps,
+-                   device=args.device, use_harp_loss=args.use_harp_loss)
++                   device=args.device, use_harp_loss=args.use_harp_loss,
++                   allow_semantic_fallback=args.allow_semantic_fallback)
+     train(cfg, mcfg, args.files)
+ 
+ 
+@@ -1273,6 +1544,16 @@
+     pt.add_argument("--top-k", type=int, default=2, dest="top_k")
+     pt.add_argument("--causal", action="store_true")
+     pt.add_argument("--use-harp-loss", action="store_true", dest="use_harp_loss")
++    pt.add_argument("--semantic-backend", default="whisper", dest="semantic_backend",
++                    choices=["whisper", "wavlm", "mfcc", "auto"],
++                    help="semantic feature extractor (whisper needs openai-whisper)")
++    pt.add_argument("--whisper-model", default="base", dest="whisper_model",
++                    help="openai-whisper model name: tiny, base, small, medium, ...")
++    pt.add_argument("--no-semantic", action="store_true", dest="no_semantic",
++                    help="disable the semantic anchor (fully offline training)")
++    pt.add_argument("--allow-semantic-fallback", action="store_true",
++                    dest="allow_semantic_fallback",
++                    help="permit MFCC when the semantic backend is missing")
+     pt.add_argument("--dry-run", action="store_true", dest="dry_run")
+     pt.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+     pt.set_defaults(fn=cmd_train)
